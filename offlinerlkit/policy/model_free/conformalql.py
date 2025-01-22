@@ -8,10 +8,6 @@ from typing import Dict, Union, Tuple
 from offlinerlkit.policy import SACPolicy
 
 class ConformalQLPolicy(SACPolicy):
-    """
-    Conformal Q-Learning with Actor-Critic architecture
-    """
-
     def __init__(
         self,
         actor: nn.Module,
@@ -24,8 +20,8 @@ class ConformalQLPolicy(SACPolicy):
         tau: float = 0.005,
         gamma: float = 0.99,
         alpha: float = 0.2,
-        calibration_alpha: float = 0.1,  # Changed to match run file
-        lambda_conf: float = 1.0,        # Changed to match run file
+        calibration_alpha: float = 0.1,
+        lambda_conf: float = 1.0,
         calibration_size: int = 1000
     ) -> None:
         super().__init__(
@@ -41,18 +37,56 @@ class ConformalQLPolicy(SACPolicy):
         )
 
         self.action_space = action_space
-        self._calibration_alpha = calibration_alpha  # Changed name
-        self._lambda_conf = lambda_conf              # Changed name
+        self._calibration_alpha = calibration_alpha
+        self._lambda_conf = lambda_conf
         self._calibration_size = calibration_size
         
-        # Initialize calibration buffer
-        self.calibration_errors = []
-        
+        # Flag to track if calibration set is initialized
+        self._is_calibrated = False
+        self.calibration_errors = None
+
+    def _initialize_calibration_set(self, batch: Dict) -> torch.Tensor:
+        """
+        Initialize calibration set from a batch of data
+        """
+        with torch.no_grad():
+            obss = batch["observations"]
+            actions = batch["actions"]
+            next_obss = batch["next_observations"]
+            rewards = batch["rewards"]
+            terminals = batch["terminals"]
+            
+            # Get target values
+            next_actions, next_log_probs = self.actforward(next_obss)
+            next_q = torch.min(
+                self.critic1_old(next_obss, next_actions),
+                self.critic2_old(next_obss, next_actions)
+            )
+            next_q -= self._alpha * next_log_probs
+            target_q = rewards + self._gamma * (1 - terminals) * next_q
+            
+            # Get current predictions
+            q1, q2 = self.critic1(obss, actions), self.critic2(obss, actions)
+            
+            # Compute absolute errors for both critics
+            errors1 = torch.abs(q1 - target_q)
+            errors2 = torch.abs(q2 - target_q)
+            
+            # Combine errors from both critics
+            all_errors = torch.cat([errors1, errors2])
+            
+            # If batch is larger than calibration_size, randomly sample
+            if len(all_errors) > self._calibration_size:
+                idx = torch.randperm(len(all_errors))[:self._calibration_size]
+                all_errors = all_errors[idx]
+            
+        return all_errors
+
     def compute_conformal_interval(self, errors: torch.Tensor) -> torch.Tensor:
         """
         Compute the conformal prediction interval based on calibration errors
         """
-        if len(errors) == 0:
+        if errors is None:
             return torch.tensor(float('inf')).to(self.actor.device)
             
         sorted_errors = torch.sort(errors)[0]
@@ -60,18 +94,12 @@ class ConformalQLPolicy(SACPolicy):
         index = min(max(index, 0), len(errors) - 1)
         return sorted_errors[index]
 
-    def update_calibration_set(self, q_pred: torch.Tensor, q_target: torch.Tensor):
-        """
-        Update the calibration set with new prediction errors
-        """
-        errors = torch.abs(q_pred - q_target)
-        self.calibration_errors.extend(errors.detach().cpu().tolist())
-        
-        # Keep only the most recent errors
-        if len(self.calibration_errors) > self._calibration_size:
-            self.calibration_errors = self.calibration_errors[-self._calibration_size:]
-
     def learn(self, batch: Dict) -> Dict[str, float]:
+        # Initialize calibration set if not done yet
+        if not self._is_calibrated:
+            self.calibration_errors = self._initialize_calibration_set(batch)
+            self._is_calibrated = True
+
         obss, actions, next_obss, rewards, terminals = batch["observations"], batch["actions"], \
             batch["next_observations"], batch["rewards"], batch["terminals"]
         batch_size = obss.shape[0]
@@ -80,10 +108,8 @@ class ConformalQLPolicy(SACPolicy):
         a, log_probs = self.actforward(obss)
         q1a, q2a = self.critic1(obss, a), self.critic2(obss, a)
         
-        # Get conformal prediction interval
-        conformal_q = self.compute_conformal_interval(
-            torch.tensor(self.calibration_errors).to(self.actor.device)
-        )
+        # Get conformal prediction interval from fixed calibration set
+        conformal_q = self.compute_conformal_interval(self.calibration_errors)
         
         # Modified actor loss with conformal regularization
         actor_loss = (self._alpha * log_probs - torch.min(q1a, q2a) + 
@@ -93,7 +119,7 @@ class ConformalQLPolicy(SACPolicy):
         actor_loss.backward()
         self.actor_optim.step()
 
-        # Compute target Q-values
+        # Rest of the learning process remains the same
         with torch.no_grad():
             next_actions, next_log_probs = self.actforward(next_obss)
             next_q = torch.min(
@@ -103,16 +129,10 @@ class ConformalQLPolicy(SACPolicy):
             next_q -= self._alpha * next_log_probs
             target_q = rewards + self._gamma * (1 - terminals) * next_q
 
-        # Update critics
         q1, q2 = self.critic1(obss, actions), self.critic2(obss, actions)
         critic1_loss = F.mse_loss(q1, target_q)
         critic2_loss = F.mse_loss(q2, target_q)
 
-        # Update calibration set
-        self.update_calibration_set(q1, target_q.detach())
-        self.update_calibration_set(q2, target_q.detach())
-
-        # Update critics
         self.critic1_optim.zero_grad()
         critic1_loss.backward()
         self.critic1_optim.step()
